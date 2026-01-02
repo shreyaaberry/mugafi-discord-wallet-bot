@@ -3,7 +3,7 @@ const { REST, Routes, SlashCommandBuilder } = require("discord.js");
 const commands = [
   new SlashCommandBuilder()
     .setName("linkwallet")
-    .setDescription("Link a wallet address to your Discord (writes to whitelist sheet)")
+    .setDescription("Link your wallet to be whitelisted for launchpad")
     .addStringOption(opt =>
       opt.setName("address")
         .setDescription("Wallet address (0x...)")
