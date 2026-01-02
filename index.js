@@ -1,10 +1,35 @@
+/**
+ * Mugafi Wallet Bot (Discord -> Google Sheets)
+ *
+ * Required Railway Variables:
+ * DISCORD_TOKEN=xxxxxxxx
+ * DISCORD_CLIENT_ID=xxxxxxxx
+ * GUILD_ID=xxxxxxxx
+ * IP_ROLE_ID=1450940518090674176
+ * SHEETS_WEBHOOK_URL=https://script.google.com/macros/s/XXXXX/exec
+ * SHEETS_TOKEN=your_secret_token
+ *
+ * Notes:
+ * - Slash command option name MUST be "address" (as seen in your Discord UI)
+ * - Google Apps Script must support actions:
+ *   - action=add_wallet
+ *   - action=list_wallets
+ *   - action=remove_wallet
+ */
+
 const { Client, GatewayIntentBits, Events } = require("discord.js");
 
-// Node 18+ has fetch built-in (Railway does).
+// Node 18+ has fetch built-in (Railway does). If not, you'd need node-fetch.
 const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL;
 const SHEETS_TOKEN = process.env.SHEETS_TOKEN;
 
-const ALLOWED_COMMANDS = new Set(["linkwallet", "addwallet", "wallets", "removewallet"]);
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+});
+
+function isValidEvmAddress(addr) {
+  return /^0x[a-fA-F0-9]{40}$/.test(addr);
+}
 
 function hasIPRole(interaction) {
   const roleId = process.env.IP_ROLE_ID;
@@ -12,118 +37,149 @@ function hasIPRole(interaction) {
   return interaction.member?.roles?.cache?.has(roleId);
 }
 
-function isValidEvmAddress(addr) {
-  return /^0x[a-fA-F0-9]{40}$/.test(addr);
-}
-
-function mustUseChannel(interaction) {
-  const allowedChannelId = process.env.WALLET_CHANNEL_ID;
-  if (!allowedChannelId) return false; // no channel lock
-  return interaction.channelId !== allowedChannelId;
-}
-
-async function postToSheets(payload) {
+async function sheetsPost(payload) {
   if (!SHEETS_WEBHOOK_URL) throw new Error("Missing SHEETS_WEBHOOK_URL");
   if (!SHEETS_TOKEN) throw new Error("Missing SHEETS_TOKEN");
 
   const res = await fetch(SHEETS_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      token: SHEETS_TOKEN,
-      ...payload,
-    }),
+    body: JSON.stringify({ token: SHEETS_TOKEN, ...payload }),
   });
 
-  // Apps Script often returns 200 even for app-level errors, so parse JSON.
-  const data = await res.json().catch(() => null);
-
-  if (!res.ok) {
-    throw new Error(`Sheets HTTP ${res.status}: ${JSON.stringify(data)}`);
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // If Apps Script returned HTML or text
+    throw new Error(`Sheets non-JSON response: ${text.slice(0, 200)}`);
   }
-  if (!data || data.ok !== true) {
-    throw new Error(`Sheets error: ${JSON.stringify(data)}`);
+
+  if (!res.ok || json?.ok === false) {
+    throw new Error(
+      `Sheets error: HTTP ${res.status} | ${JSON.stringify(json)}`
+    );
   }
 
-  return data;
+  return json;
 }
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
 
 client.once("ready", () => {
   console.log(`Bot online as ${client.user.tag}`);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  // Always defer so Discord doesn't show "application did not respond"
   try {
-    if (!interaction.isChatInputCommand()) return;
-
-    const name = interaction.commandName;
-    if (!ALLOWED_COMMANDS.has(name)) return;
-
-    // Respond within 3 seconds, always.
     await interaction.deferReply({ ephemeral: true });
+  } catch (e) {
+    // If already acknowledged, just ignore
+  }
 
-    // Optional channel lock.
-    if (mustUseChannel(interaction)) {
-      return interaction.editReply("Use this in the wallet-link channel.");
-    }
+  // Role gating first (mandatory)
+  if (!hasIPRole(interaction)) {
+    return interaction.editReply(
+      "Verify first via Collab.Land to unlock IP access."
+    );
+  }
 
-    // Mandatory IP gating.
-    if (!hasIPRole(interaction)) {
-      return interaction.editReply("Verify first via Collab.Land to unlock IP access.");
-    }
+  const cmd = interaction.commandName;
 
-    // Command routing
-    if (name === "wallets") {
-      // If you want /wallets to read from Google Sheets later, we can add it.
-      return interaction.editReply("You are verified. Wallet listing will be added next.");
-    }
-
-    if (name === "removewallet") {
-      // Removal needs a lookup store, or you can append a removal row in Sheets.
-      return interaction.editReply("Wallet removal will be added next.");
-    }
-
-    if (name === "linkwallet" || name === "addwallet") {
-      const wallet = interaction.options.getString("wallet_address", true).trim();
+  // ---- /linkwallet and /addwallet (same behavior) ----
+  if (cmd === "linkwallet" || cmd === "addwallet") {
+    try {
+      // IMPORTANT: option name is "address"
+      const wallet = interaction.options.getString("address", true).trim();
 
       if (!isValidEvmAddress(wallet)) {
-        return interaction.editReply("Invalid wallet address. Please paste a valid EVM address (0x...).");
+        return interaction.editReply("❌ Invalid EVM wallet address.");
       }
 
-      // Write to Sheets
-      await postToSheets({
-        wallet_address: wallet,
+      const payload = {
+        action: "add_wallet",
+        timestamp_utc: new Date().toISOString(),
         discord_user_id: interaction.user.id,
         discord_username: interaction.user.tag,
-        role: "IP Lord",
-        source: "discord-bot",
+        wallet_address: wallet,
         chain_id: "1",
-      });
+        role: "IP Lord",
+        source: "discord",
+      };
 
-      return interaction.editReply("✅ Wallet received. You are now whitelisted for launchpad access.");
+      await sheetsPost(payload);
+
+      return interaction.editReply(
+        "✅ Wallet linked successfully. You are whitelisted for the launchpad."
+      );
+    } catch (err) {
+      console.error("linkwallet/addwallet error:", err);
+      return interaction.editReply(
+        "Something broke on our side. Try again in a minute."
+      );
     }
-
-    // Fallback
-    return interaction.editReply("Command received.");
-  } catch (err) {
-    console.error("Interaction error:", err);
-
-    // Try to reply gracefully.
-    try {
-      if (interaction.deferred) {
-        await interaction.editReply("Something broke on our side. Try again in a minute.");
-      } else {
-        await interaction.reply({
-          content: "Something broke on our side. Try again in a minute.",
-          ephemeral: true,
-        });
-      }
-    } catch (_) {}
   }
+
+  // ---- /wallets ----
+  if (cmd === "wallets") {
+    try {
+      const payload = {
+        action: "list_wallets",
+        discord_user_id: interaction.user.id,
+      };
+
+      const result = await sheetsPost(payload);
+
+      const wallets = Array.isArray(result.wallets) ? result.wallets : [];
+
+      if (wallets.length === 0) {
+        return interaction.editReply("No wallets linked yet.");
+      }
+
+      const lines = wallets.map((w, i) => `${i + 1}. ${w}`);
+      return interaction.editReply(`Your linked wallets:\n${lines.join("\n")}`);
+    } catch (err) {
+      console.error("wallets list error:", err);
+      return interaction.editReply(
+        "Could not fetch wallets right now. Try again in a minute."
+      );
+    }
+  }
+
+  // ---- /removewallet ----
+  if (cmd === "removewallet") {
+    try {
+      const wallet = interaction.options.getString("address", true).trim();
+
+      if (!isValidEvmAddress(wallet)) {
+        return interaction.editReply("❌ Invalid EVM wallet address.");
+      }
+
+      const payload = {
+        action: "remove_wallet",
+        discord_user_id: interaction.user.id,
+        wallet_address: wallet,
+      };
+
+      const result = await sheetsPost(payload);
+
+      if (result.removed) {
+        return interaction.editReply("✅ Wallet removed.");
+      }
+
+      return interaction.editReply("That wallet was not found for your user.");
+    } catch (err) {
+      console.error("removewallet error:", err);
+      return interaction.editReply(
+        "Could not remove wallet right now. Try again in a minute."
+      );
+    }
+  }
+
+  // Fallback
+  return interaction.editReply("Command not recognized.");
 });
 
 client.login(process.env.DISCORD_TOKEN);
