@@ -3,23 +3,31 @@
  *
  * Required Railway Variables:
  * DISCORD_TOKEN=xxxxxxxx
- * DISCORD_CLIENT_ID=xxxxxxxx
- * GUILD_ID=xxxxxxxx
  * IP_ROLE_ID=1450940518090674176
  * SHEETS_WEBHOOK_URL=https://script.google.com/macros/s/XXXXX/exec
  * SHEETS_TOKEN=your_secret_token
  *
+ * Optional (recommended):
+ * WALLET_CHANNEL_ID=123456789012345678   // lock commands to one channel
+ *
  * Notes:
  * - Slash command option name MUST be "address" (as seen in your Discord UI)
- * - Google Apps Script must support actions:
+ * - Apps Script supports:
  *   - action=add_wallet
  *   - action=list_wallets
  *   - action=remove_wallet
+ *
+ * Commands:
+ * /linkwallet  (IP Lord only) -> status=whitelist
+ * /addwallet   (IP Lord only) -> status=whitelist
+ * /waitlist    (anyone)       -> status=waitlist
+ * /wallets     (IP Lord only) -> lists active wallets for user
+ * /removewallet(IP Lord only) -> marks wallet removed
  */
 
 const { Client, GatewayIntentBits, Events } = require("discord.js");
 
-// Node 18+ has fetch built-in (Railway does). If not, you'd need node-fetch.
+// Node 18+ has fetch built-in (Railway does).
 const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL;
 const SHEETS_TOKEN = process.env.SHEETS_TOKEN;
 
@@ -37,6 +45,12 @@ function hasIPRole(interaction) {
   return interaction.member?.roles?.cache?.has(roleId);
 }
 
+function isWrongChannel(interaction) {
+  const allowedChannelId = process.env.WALLET_CHANNEL_ID;
+  if (!allowedChannelId) return false; // no channel lock
+  return interaction.channelId !== allowedChannelId;
+}
+
 async function sheetsPost(payload) {
   if (!SHEETS_WEBHOOK_URL) throw new Error("Missing SHEETS_WEBHOOK_URL");
   if (!SHEETS_TOKEN) throw new Error("Missing SHEETS_TOKEN");
@@ -52,14 +66,11 @@ async function sheetsPost(payload) {
   try {
     json = JSON.parse(text);
   } catch {
-    // If Apps Script returned HTML or text
     throw new Error(`Sheets non-JSON response: ${text.slice(0, 200)}`);
   }
 
   if (!res.ok || json?.ok === false) {
-    throw new Error(
-      `Sheets error: HTTP ${res.status} | ${JSON.stringify(json)}`
-    );
+    throw new Error(`Sheets error: HTTP ${res.status} | ${JSON.stringify(json)}`);
   }
 
   return json;
@@ -70,67 +81,78 @@ client.once("ready", () => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  // Always defer so Discord doesn't show "application did not respond"
   try {
+    if (!interaction.isChatInputCommand()) return;
+
+    // Always defer so Discord doesn't show "The application did not respond"
     await interaction.deferReply({ ephemeral: true });
-  } catch (e) {
-    // If already acknowledged, just ignore
-  }
 
-  // Role gating first (mandatory)
-  if (!hasIPRole(interaction)) {
-    return interaction.editReply(
-      "Verify first via Collab.Land to unlock IP access."
-    );
-  }
+    const cmd = interaction.commandName;
 
-  const cmd = interaction.commandName;
+    // Optional channel lock (same channel for all commands)
+    if (isWrongChannel(interaction)) {
+      return interaction.editReply("Use this in the designated wallet channel.");
+    }
 
-  // ---- /linkwallet and /addwallet (same behavior) ----
-  if (cmd === "linkwallet" || cmd === "addwallet") {
-    try {
-      // IMPORTANT: option name is "address"
+    // ---- /waitlist (ANYONE) ----
+    if (cmd === "waitlist") {
       const wallet = interaction.options.getString("address", true).trim();
 
       if (!isValidEvmAddress(wallet)) {
         return interaction.editReply("❌ Invalid EVM wallet address.");
       }
 
-      const payload = {
+      await sheetsPost({
         action: "add_wallet",
         timestamp_utc: new Date().toISOString(),
         discord_user_id: interaction.user.id,
         discord_username: interaction.user.tag,
         wallet_address: wallet,
-        chain_id: "1",
-        role: "IP Lord",
-        source: "discord",
-      };
-
-      await sheetsPost(payload);
+        chain_id: "43114", // Avalanche C-Chain
+        role: "none",
+        status: "waitlist",
+        source: "discord-waitlist",
+      });
 
       return interaction.editReply(
-        "✅ Wallet linked successfully. You are whitelisted for the launchpad."
-      );
-    } catch (err) {
-      console.error("linkwallet/addwallet error:", err);
-      return interaction.editReply(
-        "Something broke on our side. Try again in a minute."
+        "✅ Added to waitlist. This does not guarantee whitelist access. Verify NFT to activate."
       );
     }
-  }
 
-  // ---- /wallets ----
-  if (cmd === "wallets") {
-    try {
-      const payload = {
+    // Everything below is IP Lord only
+    if (!hasIPRole(interaction)) {
+      return interaction.editReply("Verify first via Collab.Land to unlock IP access.");
+    }
+
+    // ---- /linkwallet and /addwallet (same behavior) ----
+    if (cmd === "linkwallet" || cmd === "addwallet") {
+      const wallet = interaction.options.getString("address", true).trim();
+
+      if (!isValidEvmAddress(wallet)) {
+        return interaction.editReply("❌ Invalid EVM wallet address.");
+      }
+
+      await sheetsPost({
+        action: "add_wallet",
+        timestamp_utc: new Date().toISOString(),
+        discord_user_id: interaction.user.id,
+        discord_username: interaction.user.tag,
+        wallet_address: wallet,
+        chain_id: "43114", // Avalanche C-Chain
+        role: "IP Lord",
+        status: "whitelist",
+        source: "discord-whitelist",
+      });
+
+      return interaction.editReply("✅ Wallet linked. You are whitelisted for the launchpad.");
+    }
+
+    // ---- /wallets ----
+    if (cmd === "wallets") {
+      const result = await sheetsPost({
         action: "list_wallets",
         discord_user_id: interaction.user.id,
-      };
-
-      const result = await sheetsPost(payload);
+      });
 
       const wallets = Array.isArray(result.wallets) ? result.wallets : [];
 
@@ -140,46 +162,45 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const lines = wallets.map((w, i) => `${i + 1}. ${w}`);
       return interaction.editReply(`Your linked wallets:\n${lines.join("\n")}`);
-    } catch (err) {
-      console.error("wallets list error:", err);
-      return interaction.editReply(
-        "Could not fetch wallets right now. Try again in a minute."
-      );
     }
-  }
 
-  // ---- /removewallet ----
-  if (cmd === "removewallet") {
-    try {
+    // ---- /removewallet ----
+    if (cmd === "removewallet") {
       const wallet = interaction.options.getString("address", true).trim();
 
       if (!isValidEvmAddress(wallet)) {
         return interaction.editReply("❌ Invalid EVM wallet address.");
       }
 
-      const payload = {
+      const result = await sheetsPost({
         action: "remove_wallet",
         discord_user_id: interaction.user.id,
         wallet_address: wallet,
-      };
-
-      const result = await sheetsPost(payload);
+      });
 
       if (result.removed) {
         return interaction.editReply("✅ Wallet removed.");
       }
-
       return interaction.editReply("That wallet was not found for your user.");
-    } catch (err) {
-      console.error("removewallet error:", err);
-      return interaction.editReply(
-        "Could not remove wallet right now. Try again in a minute."
-      );
+    }
+
+    // Fallback
+    return interaction.editReply("Command not recognized.");
+  } catch (err) {
+    console.error("Interaction error:", err);
+    try {
+      // If deferReply succeeded, editReply works
+      return interaction.editReply("Something broke on our side. Try again in a minute.");
+    } catch (_) {
+      // If deferReply failed, attempt reply
+      try {
+        return interaction.reply({
+          content: "Something broke on our side. Try again in a minute.",
+          ephemeral: true,
+        });
+      } catch (_) {}
     }
   }
-
-  // Fallback
-  return interaction.editReply("Command not recognized.");
 });
 
 client.login(process.env.DISCORD_TOKEN);
